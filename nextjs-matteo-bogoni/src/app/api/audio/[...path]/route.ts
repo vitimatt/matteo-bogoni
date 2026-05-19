@@ -1,54 +1,59 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Range, Content-Type',
+  'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: { path: string[] } }
 ) {
   try {
-    // Reconstruct the full path from the catch-all route
     const audioPath = params.path.join('/')
-    
-    // Validate that this is a Sanity audio URL
+
     if (!audioPath.includes('cdn.sanity.io')) {
       return new NextResponse('Invalid audio source', { status: 400 })
     }
 
-    // Construct the full URL
     const audioUrl = `https://${audioPath}`
-    
-    console.log('Proxying audio request to:', audioUrl)
+    const rangeHeader = request.headers.get('range')
 
-    // Fetch the audio file from Sanity
+    const upstreamHeaders: HeadersInit = {
+      'User-Agent': 'Next.js Audio Proxy',
+    }
+    if (rangeHeader) {
+      upstreamHeaders['Range'] = rangeHeader
+    }
+
     const response = await fetch(audioUrl, {
       method: 'GET',
-      headers: {
-        'User-Agent': 'Next.js Audio Proxy',
-      },
+      headers: upstreamHeaders,
     })
 
-    if (!response.ok) {
-      console.error('Failed to fetch audio:', response.status, response.statusText)
+    if (!response.ok && response.status !== 206) {
       return new NextResponse('Audio not found', { status: response.status })
     }
 
-    // Get the audio data
-    const audioBuffer = await response.arrayBuffer()
-    
-    // Get content type from the original response
-    const contentType = response.headers.get('content-type') || 'audio/mpeg'
+    const headers = new Headers(corsHeaders)
+    const contentType = response.headers.get('content-type')
+    if (contentType) headers.set('Content-Type', contentType)
 
-    // Return the audio with proper CORS headers
-    return new NextResponse(audioBuffer, {
-      status: 200,
-      headers: {
-        'Content-Type': contentType,
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Range, Content-Type',
-        'Access-Control-Expose-Headers': 'Content-Length, Content-Range',
-        'Cache-Control': 'public, max-age=86400', // Cache for 24 hours
-        'Content-Length': audioBuffer.byteLength.toString(),
-      },
+    const contentLength = response.headers.get('content-length')
+    if (contentLength) headers.set('Content-Length', contentLength)
+
+    const contentRange = response.headers.get('content-range')
+    if (contentRange) headers.set('Content-Range', contentRange)
+
+    const acceptRanges = response.headers.get('accept-ranges')
+    headers.set('Accept-Ranges', acceptRanges || 'bytes')
+    headers.set('Cache-Control', 'public, max-age=86400, immutable')
+
+    return new NextResponse(response.body, {
+      status: response.status,
+      headers,
     })
   } catch (error) {
     console.error('Error proxying audio:', error)
@@ -56,13 +61,11 @@ export async function GET(
   }
 }
 
-export async function OPTIONS(request: NextRequest) {
+export async function OPTIONS() {
   return new NextResponse(null, {
     status: 200,
     headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Range, Content-Type',
+      ...corsHeaders,
       'Access-Control-Max-Age': '86400',
     },
   })

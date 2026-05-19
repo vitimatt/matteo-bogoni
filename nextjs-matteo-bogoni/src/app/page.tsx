@@ -1,4 +1,4 @@
-import { client, Track } from '@/sanity/client'
+import { client, Track, Project } from '@/sanity/client'
 import AudioReactive from '@/components/AudioReactive'
 
 async function getTracks(): Promise<Track[]> {
@@ -12,8 +12,22 @@ async function getTracks(): Promise<Track[]> {
   return await client.fetch(query)
 }
 
+async function getProjects(): Promise<Project[]> {
+  const query = `*[_type == "project"] | order(_createdAt desc) {
+    _id,
+    title,
+    "mediaType": media.mediaType,
+    "mediaUrl": select(
+      media.mediaType == "image" => media.image.asset->url,
+      media.mediaType == "video" => media.video.asset->url
+    )
+  }`
+
+  return await client.fetch(query)
+}
+
 export default async function Home() {
-  const tracks = await getTracks()
+  const [tracks, projects] = await Promise.all([getTracks(), getProjects()])
   
   // Debug: Log tracks data
   console.log('=== SANITY DATA DEBUG ===')
@@ -38,7 +52,7 @@ export default async function Home() {
       margin: 0,
       padding: 0
     }}>
-      <AudioReactive tracks={tracks} />
+      <AudioReactive tracks={tracks} projects={projects} />
     </main>
   )
 }

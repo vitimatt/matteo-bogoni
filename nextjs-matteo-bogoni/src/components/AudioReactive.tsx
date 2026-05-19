@@ -1,11 +1,17 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { Track } from '@/sanity/client'
+import { Project, Track } from '@/sanity/client'
 import { getAudioSource } from '@/lib/audio-utils'
 
 interface AudioReactiveProps {
   tracks: Track[]
+  projects: Project[]
+}
+
+type ProjectMediaPreview = {
+  mediaType: 'image' | 'video'
+  url: string
 }
 
 declare global {
@@ -15,7 +21,7 @@ declare global {
   }
 }
 
-export default function AudioReactive({ tracks }: AudioReactiveProps) {
+export default function AudioReactive({ tracks, projects }: AudioReactiveProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const p5InstanceRef = useRef<any>(null)
   const [selectedTrackIndex, setSelectedTrackIndex] = useState(0)
@@ -40,6 +46,8 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
     width: number
   } | null>(null)
 
+  const [projectMediaPreview, setProjectMediaPreview] = useState<ProjectMediaPreview | null>(null)
+
   // Callback function to update selected track index from p5.js
   const updateSelectedTrackIndex = (index: number) => {
     setSelectedTrackIndex(index)
@@ -54,7 +62,39 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
     setProgressBoxState(visible ? { visible: true, y, height, width } : null)
   }
 
+  const updateProjectMediaPreview = (preview: ProjectMediaPreview | null) => {
+    setProjectMediaPreview(preview)
+  }
+
+  // Warm browser cache for all tracks before p5 finishes loading
   useEffect(() => {
+    const controllers: AbortController[] = []
+    tracks.forEach((track, index) => {
+      const { url } = getAudioSource(track, index)
+      if (!url.startsWith('http')) return
+      const controller = new AbortController()
+      controllers.push(controller)
+      fetch(url, {
+        mode: 'cors',
+        credentials: 'omit',
+        signal: controller.signal,
+      }).catch(() => {})
+    })
+    return () => controllers.forEach((c) => c.abort())
+  }, [tracks])
+
+  useEffect(() => {
+    projects.forEach((project) => {
+      if (!project.mediaUrl) return
+      const img = new Image()
+      img.src = project.mediaUrl
+    })
+  }, [projects])
+
+  useEffect(() => {
+    const trackCache = new Map<number, any>()
+    const trackLoadPromises = new Map<number, Promise<any>>()
+
     // Add a small delay to ensure component is fully mounted
     const timer = setTimeout(() => {
       console.log('=== COMPONENT MOUNT DEBUG ===')
@@ -130,6 +170,9 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
         let audioStarted = false
         let canvasContext: CanvasRenderingContext2D | null = null
         let trackLines: string[] = []
+        let projectLines: string[] = []
+        let hoveredProjectIndex: number | null = null
+        let projectHoverAreas: Array<{x: number, y: number, width: number, height: number, projectIndex: number}> = []
         let textLines: string[] = []
         let cursorX = 0
         let effectMultiplier = 2.0
@@ -143,7 +186,7 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
         let selectedTrackIndex = 0
         
         // Metadata
-        let metadataClickAreas: Array<{x: number, y: number, width: number, height: number, type: 'email' | 'phone' | 'ig'}> = []
+        let metadataClickAreas: Array<{x: number, y: number, width: number, height: number, type: 'email' | 'ig'}> = []
         let totalPlayTime = 0 // Will be calculated from track durations
         let trackDurations: number[] = [] // Duration in seconds for each track
         
@@ -517,153 +560,127 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           return multiplier
         }
 
-        const loadTrack = (trackIndex: number, shouldPlayImmediately: boolean = false) => {
-          console.log(`loadTrack called: trackIndex=${trackIndex}, shouldPlayImmediately=${shouldPlayImmediately}, isTransitioning=${isTransitioning}`)
-          
-          // Clear progress box immediately when switching tracks
-          updateProgressBox(false, 0, 0, 0)
-          
-          // Immediately stop current audio and clear spectrum to prevent old audio affecting animation
-          if (song) {
-            try {
-              song.stop()
-              song.dispose()
-            } catch (error) {
-              console.log('Error stopping/disposing song:', error)
+        const updateTrackDuration = (trackIndex: number, soundFile: any) => {
+          try {
+            if (soundFile && typeof soundFile.duration === 'function') {
+              const duration = soundFile.duration()
+              if (duration && duration > 0) {
+                trackDurations[trackIndex] = duration
+                totalPlayTime = trackDurations.reduce((sum, dur) => sum + dur, 0)
+              }
+            } else if (soundFile?.buffer?.duration) {
+              trackDurations[trackIndex] = soundFile.buffer.duration
+              totalPlayTime = trackDurations.reduce((sum, dur) => sum + dur, 0)
             }
-            song = null
+          } catch (e) {
+            console.log('Could not get audio duration:', e)
           }
-          
-          // Clear spectrum immediately to stop animation from old track
-          spectrum.fill(0)
-          
-          // Load new track immediately
-          const trackToLoad = tracks.length > 0 ? tracks[trackIndex] : null
-          
-          if (trackToLoad) {
-            // Get the best audio source with CORS support
-            const { url: audioUrl, source } = getAudioSource(trackToLoad, trackIndex)
-            
+        }
+
+        const stopActiveSong = () => {
+          if (!song) return
+          try {
+            song.stop()
+          } catch (error) {
+            console.log('Error stopping song:', error)
+          }
+          song = null
+        }
+
+        const playSoundFile = (soundFile: any, shouldPlayImmediately: boolean) => {
+          if (!shouldPlayImmediately || !soundFile) return
+          try {
+            soundFile.stop()
+            soundFile.play()
+            soundFile.loop()
+            soundFile.setVolume(isTransitioning ? 0 : 1.0)
+          } catch (error) {
+            console.error('Error playing audio:', error)
+          }
+        }
+
+        const loadSoundIntoCache = (trackIndex: number, audioUrl: string, source: string): Promise<any> => {
+          const existing = trackCache.get(trackIndex)
+          if (existing?.isLoaded?.()) {
+            return Promise.resolve(existing)
+          }
+
+          const pending = trackLoadPromises.get(trackIndex)
+          if (pending) return pending
+
+          const promise = new Promise<any>((resolve, reject) => {
             console.log(`Loading audio from ${source}: ${audioUrl}`)
-            
-            song = p.loadSound(audioUrl, () => {
-              console.log(`Audio loaded successfully from ${source}: ${audioUrl}`)
-              
-              // Try to get duration and update trackDurations
-              try {
-                if (song && typeof song.duration === 'function') {
-                  const duration = song.duration()
-                  if (duration && duration > 0) {
-                    trackDurations[trackIndex] = duration
-                    totalPlayTime = trackDurations.reduce((sum, dur) => sum + dur, 0)
-                  }
-                } else if (song && song.buffer && song.buffer.duration) {
-                  const duration = song.buffer.duration
-                  trackDurations[trackIndex] = duration
-                  totalPlayTime = trackDurations.reduce((sum, dur) => sum + dur, 0)
-                }
-              } catch (e) {
-                console.log('Could not get audio duration:', e)
+            p.loadSound(
+              audioUrl,
+              (loadedSong: any) => {
+                trackCache.set(trackIndex, loadedSong)
+                trackLoadPromises.delete(trackIndex)
+                updateTrackDuration(trackIndex, loadedSong)
+                console.log(`Audio cached from ${source}: ${audioUrl}`)
+                resolve(loadedSong)
+              },
+              (error: any) => {
+                trackLoadPromises.delete(trackIndex)
+                reject(error)
               }
-              
-              // Only play if explicitly requested
-              if (shouldPlayImmediately) {
-                try {
-                  song.play()
-                  song.loop()
-                  
-                  // Set initial volume based on transition state
-                  if (isTransitioning) {
-                    // If we're transitioning, start at volume 0 (will be faded in)
-                    song.setVolume(0)
-                  } else {
-                    // Normal playback at full volume
-                    song.setVolume(1.0)
-                  }
-                  
-                  console.log(`Playing audio from ${source}`)
-                } catch (error) {
-                  console.error(`Error playing audio from ${source}:`, error)
-                  // Try fallback if current source fails
-                  if (source === 'sanity') {
-                    const fallbackFile = `/${trackIndex + 1}.mp3`
-                    console.log(`Trying fallback audio: ${fallbackFile}`)
-                    song = p.loadSound(fallbackFile, () => {
-                      console.log(`Fallback audio loaded: ${fallbackFile}`)
-                      if (shouldPlayImmediately) {
-                        try {
-                          song.play()
-                          song.loop()
-                          
-                          // Set initial volume based on transition state
-                          if (isTransitioning) {
-                            song.setVolume(0)
-                          } else {
-                            song.setVolume(1.0)
-                          }
-                        } catch (fallbackError) {
-                          console.error('Error playing fallback audio:', fallbackError)
-                        }
-                      }
-                    }, (fallbackLoadError: any) => {
-                      console.error(`Failed to load fallback audio: ${fallbackFile}`, fallbackLoadError)
-                    })
-                  }
-                }
-              }
-            }, (error: any) => {
+            )
+          })
+
+          trackLoadPromises.set(trackIndex, promise)
+          return promise
+        }
+
+        const ensureTrackLoaded = (trackIndex: number): Promise<any> => {
+          const cached = trackCache.get(trackIndex)
+          if (cached?.isLoaded?.()) {
+            return Promise.resolve(cached)
+          }
+
+          const trackToLoad = tracks.length > 0 ? tracks[trackIndex] : null
+          if (trackToLoad) {
+            const { url: audioUrl, source } = getAudioSource(trackToLoad, trackIndex)
+            return loadSoundIntoCache(trackIndex, audioUrl, source).catch((error) => {
               console.error(`Failed to load audio from ${source}: ${audioUrl}`, error)
-              // Try fallback if current source fails
-              if (source === 'sanity') {
-                const fallbackFile = `/${trackIndex + 1}.mp3`
-                console.log(`Loading fallback audio: ${fallbackFile}`)
-                song = p.loadSound(fallbackFile, () => {
-                  console.log(`Fallback audio loaded: ${fallbackFile}`)
-                  if (shouldPlayImmediately) {
-                    try {
-                      song.play()
-                      song.loop()
-                      
-                      // Set initial volume based on transition state
-                      if (isTransitioning) {
-                        song.setVolume(0)
-                      } else {
-                        song.setVolume(1.0)
-                      }
-                    } catch (error) {
-                      console.error('Error playing fallback audio:', error)
-                    }
-                  }
-                }, (fallbackError: any) => {
-                  console.error(`Failed to load fallback audio: ${fallbackFile}`, fallbackError)
-                })
-              }
-            })
-          } else {
-            // No tracks available, try local files
-            const localFile = `/${trackIndex + 1}.mp3`
-            console.log(`Loading local audio: ${localFile}`)
-            song = p.loadSound(localFile, () => {
-              console.log(`Local audio loaded: ${localFile}`)
-              if (shouldPlayImmediately) {
-                try {
-                  song.play()
-                  song.loop()
-                  
-                  // Set initial volume based on transition state
-                  if (isTransitioning) {
-                    song.setVolume(0)
-                  } else {
-                    song.setVolume(1.0)
-                  }
-                } catch (error) {
-                  console.error('Error playing local audio:', error)
-                }
-              }
-            }, (error: any) => {
-              console.error(`Failed to load local audio: ${localFile}`, error)
+              const fallbackFile = `/${trackIndex + 1}.mp3`
+              return loadSoundIntoCache(trackIndex, fallbackFile, 'local')
             })
           }
+
+          const localFile = `/${trackIndex + 1}.mp3`
+          return loadSoundIntoCache(trackIndex, localFile, 'local')
+        }
+
+        const preloadAllTracks = () => {
+          const count = tracks.length > 0 ? tracks.length : 3
+          for (let i = 0; i < count; i++) {
+            ensureTrackLoaded(i).catch((error) => {
+              console.warn(`Preload failed for track ${i}:`, error)
+            })
+          }
+        }
+
+        const loadTrack = (trackIndex: number, shouldPlayImmediately: boolean = false) => {
+          console.log(`loadTrack called: trackIndex=${trackIndex}, shouldPlayImmediately=${shouldPlayImmediately}`)
+
+          updateProgressBox(false, 0, 0, 0)
+          stopActiveSong()
+          spectrum.fill(0)
+
+          const cached = trackCache.get(trackIndex)
+          if (cached?.isLoaded?.()) {
+            song = cached
+            playSoundFile(song, shouldPlayImmediately)
+            return
+          }
+
+          ensureTrackLoaded(trackIndex)
+            .then((loadedSong) => {
+              song = loadedSong
+              playSoundFile(song, shouldPlayImmediately)
+            })
+            .catch((error) => {
+              console.error(`Failed to load track ${trackIndex}:`, error)
+            })
         }
 
         p.preload = () => {
@@ -696,8 +713,10 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           // Calculate total play time (will be updated when durations are known)
           totalPlayTime = trackDurations.reduce((sum, dur) => sum + dur, 0)
 
-          // Don't load any track initially - wait for user to click a track
-          console.log('Waiting for user to select a track')
+          projectLines = projects.length > 0 ? projects.map((project) => project.title) : []
+
+          // Preload all tracks in the background for instant playback on click
+          console.log('Preloading all tracks in background')
         }
 
         // Function to hyphenate a word that's too long to fit on a line
@@ -805,6 +824,63 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           }
         }
 
+        const wrapTextToLines = (text: string, maxWidth: number): string[] => {
+          if (maxWidth <= 0) return [text]
+          setFont()
+          const words = text.split(' ')
+          const lines: string[] = []
+          let currentLine = ''
+
+          for (const word of words) {
+            const spaceWidth = currentLine.length > 0 ? measureText(' ') : 0
+            const wordWidth = measureText(word)
+            const currentLineWidth = measureText(currentLine)
+            const totalWidth = currentLineWidth + spaceWidth + wordWidth
+
+            if (totalWidth <= maxWidth) {
+              currentLine = currentLine.length > 0 ? currentLine + ' ' + word : word
+            } else {
+              if (currentLine.length > 0) {
+                lines.push(currentLine.trim())
+                currentLine = ''
+              }
+
+              if (wordWidth > maxWidth) {
+                let remainingWord = word
+                while (remainingWord.length > 0) {
+                  let part = ''
+                  let partWidth = 0
+                  for (let j = 0; j < remainingWord.length; j++) {
+                    const char = remainingWord[j]
+                    const charWidth = measureChar(char)
+                    if (partWidth + charWidth <= maxWidth) {
+                      part += char
+                      partWidth += charWidth
+                    } else {
+                      break
+                    }
+                  }
+                  if (part.length === 0) {
+                    part = remainingWord.charAt(0)
+                    remainingWord = remainingWord.substring(1)
+                  } else {
+                    remainingWord = remainingWord.substring(part.length)
+                  }
+                  lines.push(part)
+                }
+              } else {
+                currentLine = word
+              }
+            }
+          }
+
+          if (currentLine.length > 0) {
+            lines.push(currentLine.trim())
+          }
+
+          return lines.length > 0 ? lines : ['']
+        }
+
         // Initialize loading animation with correct character positions
         const initializeLoadingAnimation = () => {
           loadingChars = []
@@ -818,13 +894,10 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           // Left column: metadata
           let y = startY
           const metadata = [
-            { label: 'COMPOSER', value: 'Matteo Bogoni' },
+            { label: 'SOUND DESIGNER', value: 'Matteo Bogoni' },
             { label: 'DATE', value: getCurrentDateTime() },
             { label: 'LOCATION', value: 'Milan' },
-            { label: 'TRACKS PLAY TIME', value: formatTime(totalPlayTime) },
-            { label: 'N° OF TRACKS', value: tracks.length.toString() },
             { label: 'EMAIL', value: 'info@matteobogoni.com' },
-            { label: 'PHONE', value: '+39 3490867743' },
             { label: 'IG', value: '@matteobogoni' }
           ]
           
@@ -876,8 +949,8 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
             }
             y += lineHeight
             
-            // Add line break after COMPOSER (index 0) and after N° OF TRACKS (index 4)
-            if (i === 0 || i === 4) {
+            // Add line break after SOUND DESIGNER (index 0)
+            if (i === 0) {
               y += lineHeight
             }
           }
@@ -905,12 +978,32 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           // On mobile: stack below left column with 2 line breaks, on desktop: side by side
           let rightColumnStartY = startY
           if (isMobile) {
-            // Left column has 8 items + 2 line breaks = 10 lines total
-            rightColumnStartY = y + (2 * lineHeight) // Two line breaks
+            rightColumnStartY = y + (2 * lineHeight)
           }
           
           const columnLeftMargin = isMobile ? leftMargin : (p.width / 2 + 20)
+          const rightEdgeX = p.width - 10
           y = rightColumnStartY
+
+          const pushLoadingLine = (text: string, x: number) => {
+            let cx = x
+            for (let charIndex = 0; charIndex < text.length; charIndex++) {
+              const char = text.charAt(charIndex)
+              loadingChars.push({
+                char,
+                x: cx,
+                y,
+                appeared: false,
+                appearTime: 0,
+              })
+              cx += measureChar(char)
+            }
+          }
+
+          // TRACKS header
+          pushLoadingLine('TRACKS', columnLeftMargin)
+          y += lineHeight
+
           for (let i = 0; i < trackLines.length; i++) {
             const trackTitle = trackLines[i]
             const trackDuration = trackDurations[i] || 0
@@ -947,6 +1040,22 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
               x += measureChar(char)
             }
             y += lineHeight
+          }
+
+          y += lineHeight
+
+          // PROJECTS header
+          pushLoadingLine('PROJECTS', columnLeftMargin)
+          y += lineHeight
+
+          const projectMaxWidth = rightEdgeX - columnLeftMargin
+          for (let i = 0; i < projectLines.length; i++) {
+            const projectText = `${i + 1}. ${projectLines[i]}`
+            const wrappedProjectLines = wrapTextToLines(projectText, projectMaxWidth)
+            for (const line of wrappedProjectLines) {
+              pushLoadingLine(line, columnLeftMargin)
+              y += lineHeight
+            }
           }
           
           // On desktop: Add line break before MUTE button
@@ -1036,9 +1145,9 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           
           // Adjust text size and line height for mobile (35% reduction = 65% of original)
           const isMobile = p.windowWidth <= 768
-          textSize = isMobile ? baseTextSize * 0.65 : baseTextSize
+          textSize = isMobile ? baseTextSize * 0.65 : baseTextSize * 0.9
           // Line height is 95% of base on desktop, 95% of 65% on mobile
-          lineHeight = isMobile ? baseLineHeight * 0.65 * 0.95 : baseLineHeight * 0.95
+          lineHeight = isMobile ? baseLineHeight * 0.65 * 0.95 : baseLineHeight * 0.9 * 0.95
           
           // Setup canvas context and font first (needed for text measurements)
           if (canvas && canvas.elt) {
@@ -1061,9 +1170,9 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
             p.resizeCanvas(p.windowWidth, p.windowHeight)
             // Adjust text size and line height for mobile (35% reduction = 65% of original)
             const isMobile = p.windowWidth <= 768
-            textSize = isMobile ? baseTextSize * 0.65 : baseTextSize
+            textSize = isMobile ? baseTextSize * 0.65 : baseTextSize * 0.9
             // Line height is 95% of base on desktop, 95% of 65% on mobile
-            lineHeight = isMobile ? baseLineHeight * 0.65 * 0.95 : baseLineHeight * 0.95
+            lineHeight = isMobile ? baseLineHeight * 0.65 * 0.95 : baseLineHeight * 0.9 * 0.95
             // Update font with new text size
             setFont()
             // Recalculate text lines for new width (uses actual text width)
@@ -1085,6 +1194,9 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           
           // Initialize loading animation
           initializeLoadingAnimation()
+
+          // Start preloading all tracks as soon as the canvas is ready
+          preloadAllTracks()
         }
 
         p.draw = () => {
@@ -1104,6 +1216,7 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           
           // Check if we're still in loading animation
           if (isLoading) {
+            updateProjectMediaPreview(null)
             const elapsed = p.millis() - loadingStartTime
             
             // Update which characters should appear (no fade, instant appearance)
@@ -1462,13 +1575,10 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           
           // Static labels and dynamic values
           const metadata = [
-            { label: 'COMPOSER', value: 'Matteo Bogoni' },
+            { label: 'SOUND DESIGNER', value: 'Matteo Bogoni' },
             { label: 'DATE', value: getCurrentDateTime() },
             { label: 'LOCATION', value: 'Milan' },
-            { label: 'TRACKS PLAY TIME', value: formatTime(totalPlayTime) },
-            { label: 'N° OF TRACKS', value: tracks.length.toString() },
             { label: 'EMAIL', value: 'info@matteobogoni.com', clickable: true, type: 'email' as const },
-            { label: 'PHONE', value: '+39 3490867743', clickable: true, type: 'phone' as const },
             { label: 'IG', value: '@matteobogoni', clickable: true, type: 'ig' as const }
           ]
           
@@ -1529,8 +1639,8 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
             p.text(item.value, valueX, y)
             y += lineHeight
             
-            // Add line break after COMPOSER (index 0) and after N° OF TRACKS (index 4)
-            if (i === 0 || i === 4) {
+            // Add line break after SOUND DESIGNER (index 0)
+            if (i === 0) {
               y += lineHeight
             }
           }
@@ -1538,105 +1648,91 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
           return y // Return the end Y position
         }
 
-        // Draw right column with tracks and times
+        // Draw right column with tracks, projects, and times
         const drawRightColumn = (startY: number, isMobile: boolean = false, topMarginY: number = 0) => {
           const leftMargin = 10
-          // On mobile: use left margin, on desktop: use right column position
           const columnLeftMargin = isMobile ? leftMargin : (p.width / 2 + 20)
+          const rightEdgeX = p.width - 10
           let y = startY
           p.textSize(textSize)
           setFont()
           trackClickAreas = []
-          
+          projectHoverAreas = []
+          let anyProjectHovered = false
+
+          const drawSectionHeader = (title: string) => {
+            p.fill(0)
+            p.text(title, columnLeftMargin, y)
+            y += lineHeight
+          }
+
           // On mobile: Draw MUTE/UNMUTE button at top right first
           if (isMobile && topMarginY > 0) {
-            const muteMultiplier = getMuteTransitionMultiplier()
             const displayText = isMuted ? "UNMUTE" : "MUTE"
             const textWidth = measureText(displayText)
-            const textX = p.width - 10 - textWidth // Top right
+            const textX = rightEdgeX - textWidth
             const textY = topMarginY
-            
-            // Set up clickable area
+
             muteClickArea = {
               x: textX - 5,
               y: textY - textSize + 5,
               width: textWidth + 10,
               height: lineHeight
             }
-            
-            // Draw MUTE/UNMUTE text
+
             p.fill(0)
             p.text(displayText, textX, textY)
           }
-          
-          // Draw tracks with times
+
           let hoveredBoxTrackIndex: number | null = null
           let hoveredBoxY: number = 0
           let activeBoxTrackIndex: number | null = null
           let activeBoxY: number = 0
-          
+
+          // TRACKS section
+          drawSectionHeader('TRACKS')
+
           for (let i = 0; i < trackLines.length; i++) {
             const trackTitle = trackLines[i]
             const trackDuration = trackDurations[i] || 0
             const durationText = formatTime(trackDuration)
-            
-            // Track number and title
             const trackText = `${i + 1}. ${trackTitle}`
-            const trackTextWidth = measureText(trackText)
             const trackX = columnLeftMargin
-            
-            // Duration on the right
             const durationWidth = measureText(durationText)
-            const durationX = p.width - 10 - durationWidth
-            
-            // Check if hovering over track
+            const durationX = rightEdgeX - durationWidth
             const lineY = y - textSize + 5
             const isHovering = p.mouseX >= trackX && p.mouseX <= durationX + durationWidth &&
                              p.mouseY >= lineY && p.mouseY <= lineY + lineHeight
-            
-            // Update hover state (but don't override active track)
+
             if (isHovering) {
-              // Generate new random color when hover starts on a new track (only for non-active tracks)
               if (hoveredTrackIndex !== i) {
                 if (activeTrackIndex === i) {
-                  // Use locked color for active track
                   hoverBoxColor = activeTrackColor
                 } else {
-                  // Generate random color for other tracks
                   hoverBoxColor = getRandomHoverColor()
                 }
+                ensureTrackLoaded(i).catch(() => {})
               }
               hoveredTrackIndex = i
             } else if (activeTrackIndex !== i) {
-              // Only clear hover if not the active track
               if (hoveredTrackIndex === i) {
                 hoveredTrackIndex = null
               }
             }
-            
-            // Track which track should show boxes (prioritize hovered over active)
-            const isHoveringThisTrack = hoveredTrackIndex === i
-            const isActiveTrack = activeTrackIndex === i
-            
-            if (isHoveringThisTrack) {
+
+            if (hoveredTrackIndex === i) {
               hoveredBoxTrackIndex = i
               hoveredBoxY = lineY
             }
-            
-            if (isActiveTrack) {
+            if (activeTrackIndex === i) {
               activeBoxTrackIndex = i
               activeBoxY = lineY
             }
-            
-            // Draw track (always black)
-            p.fill(0) // Black
-            p.text(trackText, trackX, y)
-            
-            // Draw duration
+
             p.fill(0)
+            p.text(trackText, trackX, y)
             p.text(durationText, durationX, y)
-            
-            // Store click area
+
             trackClickAreas.push({
               x: trackX,
               y: lineY,
@@ -1644,27 +1740,84 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
               height: lineHeight,
               trackIndex: i
             })
-            
+
             y += lineHeight
           }
-          
-          // Update hover and progress boxes once per frame (rendered as HTML outside canvas)
-          // Prioritize hovered track over active track
+
+          y += lineHeight
+
+          // PROJECTS section
+          drawSectionHeader('PROJECTS')
+
+          const projectMaxWidth = rightEdgeX - columnLeftMargin
+          for (let i = 0; i < projectLines.length; i++) {
+            const projectText = `${i + 1}. ${projectLines[i]}`
+            const projectX = columnLeftMargin
+            const rowRight = rightEdgeX
+            const wrappedProjectLines = wrapTextToLines(projectText, projectMaxWidth)
+            const blockStartY = y - textSize + 5
+            const blockHeight = wrappedProjectLines.length * lineHeight
+
+            const isHoveringBlock = p.mouseX >= projectX && p.mouseX <= rowRight &&
+              p.mouseY >= blockStartY && p.mouseY <= blockStartY + blockHeight
+
+            if (isHoveringBlock) {
+              hoveredProjectIndex = i
+              anyProjectHovered = true
+              const project = projects[i]
+              if (project?.mediaUrl && project.mediaType) {
+                updateProjectMediaPreview({
+                  mediaType: project.mediaType,
+                  url: project.mediaUrl,
+                })
+              } else {
+                updateProjectMediaPreview(null)
+              }
+            }
+
+            p.fill(0)
+            for (const line of wrappedProjectLines) {
+              p.text(line, projectX, y)
+              y += lineHeight
+            }
+
+            projectHoverAreas.push({
+              x: projectX,
+              y: blockStartY,
+              width: rowRight - projectX,
+              height: blockHeight,
+              projectIndex: i,
+            })
+          }
+
+          if (!anyProjectHovered) {
+            let stillHoveringProject = false
+            for (const area of projectHoverAreas) {
+              if (p.mouseX >= area.x && p.mouseX <= area.x + area.width &&
+                  p.mouseY >= area.y && p.mouseY <= area.y + area.height) {
+                stillHoveringProject = true
+                break
+              }
+            }
+            if (!stillHoveringProject) {
+              hoveredProjectIndex = null
+              updateProjectMediaPreview(null)
+            }
+          }
+
           const currentBoxTrackIndex = hoveredBoxTrackIndex !== null ? hoveredBoxTrackIndex : activeBoxTrackIndex
           const currentBoxY = hoveredBoxTrackIndex !== null ? hoveredBoxY : activeBoxY
-          
+
           if (currentBoxTrackIndex !== null) {
             updateTrackBoxes(currentBoxY, currentBoxTrackIndex)
           } else {
-            // No track hovered or active, hide boxes
             updateHoverBox(false, 0, 0, '#FFFFFF')
             updateProgressBox(false, 0, 0, 0)
           }
-          
-          // Reset hover state if not hovering over any track (but keep active track)
+
           if (hoveredTrackIndex !== null && hoveredTrackIndex !== activeTrackIndex) {
             let stillHovering = false
-            for (let area of trackClickAreas) {
+            for (const area of trackClickAreas) {
               if (p.mouseX >= area.x && p.mouseX <= area.x + area.width &&
                   p.mouseY >= area.y && p.mouseY <= area.y + area.height) {
                 stillHovering = true
@@ -1675,34 +1828,29 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
               hoveredTrackIndex = null
             }
           }
-          
-          // On desktop: Draw MUTE/UNMUTE button below tracks (right-aligned)
+
           if (!isMobile) {
-            // Add line break before MUTE/UNMUTE button
             y += lineHeight
-            
-            const muteMultiplier = getMuteTransitionMultiplier()
+
             const displayText = isMuted ? "UNMUTE" : "MUTE"
             const textWidth = measureText(displayText)
-            const textX = p.width - 10 - textWidth // Right-aligned like durations
+            const textX = rightEdgeX - textWidth
             const textY = y
-            
-            // Set up clickable area
+
             muteClickArea = {
               x: textX - 5,
               y: textY - textSize + 5,
               width: textWidth + 10,
               height: lineHeight
             }
-            
-            // Draw MUTE/UNMUTE text
+
             p.fill(0)
             p.text(displayText, textX, textY)
           }
         }
 
         p.mousePressed = async () => {
-          // Check if clicking on metadata (email, phone, IG)
+          // Check if clicking on metadata (email, IG)
           for (let area of metadataClickAreas) {
             if (p.mouseX >= area.x && p.mouseX <= area.x + area.width &&
                 p.mouseY >= area.y && p.mouseY <= area.y + area.height) {
@@ -1710,8 +1858,6 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
               
               if (area.type === 'email') {
                 window.open('mailto:info@matteobogoni.com', '_blank')
-              } else if (area.type === 'phone') {
-                window.open('tel:+393490867743', '_blank')
               } else if (area.type === 'ig') {
                 window.open('https://instagram.com/matteobogoni', '_blank')
               }
@@ -1781,15 +1927,7 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
                   // Clear progress box immediately when switching tracks
                   updateProgressBox(false, 0, 0, 0)
                   // Stop current track if it exists
-                  if (song) {
-                    try {
-                      song.stop()
-                      song.dispose()
-                    } catch (e) {
-                      // Ignore errors
-                    }
-                    song = null
-                  }
+                  stopActiveSong()
                   // Clear spectrum
                   spectrum.fill(0)
                   // Load and play the new track directly
@@ -1909,17 +2047,20 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
 
     return () => {
       clearTimeout(timer)
-      // Stop any playing audio before cleanup
-      if (p5InstanceRef.current && p5InstanceRef.current.song) {
-        p5InstanceRef.current.song.stop()
-        p5InstanceRef.current.song.dispose()
-      }
-      
+      trackCache.forEach((sf) => {
+        try {
+          sf.dispose()
+        } catch {
+          // ignore
+        }
+      })
+      trackCache.clear()
+      trackLoadPromises.clear()
       if (p5InstanceRef.current) {
         p5InstanceRef.current.remove()
       }
     }
-  }, [tracks])
+  }, [tracks, projects])
 
   // Handle track clicks
   const handleTrackClick = (index: number) => {
@@ -1954,7 +2095,52 @@ export default function AudioReactive({ tracks }: AudioReactiveProps) {
         />
       )}
       
-      {/* Progress box - positioned above canvas, on top of hover box */}
+      {projectMediaPreview && (
+        <div
+          style={{
+            position: 'fixed',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            zIndex: 9999,
+            pointerEvents: 'none',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          {projectMediaPreview.mediaType === 'video' ? (
+            <video
+              key={projectMediaPreview.url}
+              src={projectMediaPreview.url}
+              autoPlay
+              loop
+              muted
+              playsInline
+              style={{
+                maxWidth: '80vw',
+                maxHeight: '80vh',
+                width: 'auto',
+                height: 'auto',
+                objectFit: 'contain',
+              }}
+            />
+          ) : (
+            <img
+              src={projectMediaPreview.url}
+              alt=""
+              style={{
+                maxWidth: '80vw',
+                maxHeight: '80vh',
+                width: 'auto',
+                height: 'auto',
+                objectFit: 'contain',
+              }}
+            />
+          )}
+        </div>
+      )}
+
       {progressBoxState && progressBoxState.visible && (
         <div
           style={{

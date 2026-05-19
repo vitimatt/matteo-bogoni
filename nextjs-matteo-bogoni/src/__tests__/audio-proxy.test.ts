@@ -42,11 +42,11 @@ describe('Audio Proxy Utilities', () => {
       audioUrl: 'https://cdn.sanity.io/images/ker8zst5/production/audio.mp3'
     };
 
-    it('should return Sanity source with proxied URL when audioUrl is available', () => {
+    it('should return Sanity source with direct CDN URL when audioUrl is available', () => {
       const result = getAudioSource(mockTrack, 0);
       
       expect(result.source).toBe('sanity');
-      expect(result.url).toMatch(/^\/api\/audio\//);
+      expect(result.url).toBe(mockTrack.audioUrl);
       expect(result.url).toContain('cdn.sanity.io');
     });
 

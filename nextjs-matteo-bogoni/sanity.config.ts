@@ -10,7 +10,18 @@ export default defineConfig({
   projectId: 'ker8zst5',
   dataset: 'production',
   basePath: '/studio',
-  plugins: [structureTool(), visionTool()],
+  plugins: [
+    structureTool({
+      structure: (S) =>
+        S.list()
+          .title('Content')
+          .items([
+            S.documentTypeListItem('track').title('Tracks'),
+            S.documentTypeListItem('project').title('Projects'),
+          ]),
+    }),
+    visionTool(),
+  ],
   schema: {
     types: schemaTypes,
   },

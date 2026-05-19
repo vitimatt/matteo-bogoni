@@ -25,16 +25,16 @@ export function getProxiedAudioUrl(sanityUrl: string): string {
 }
 
 /**
- * Determines the best audio source with fallback support
+ * Determines the best audio source with fallback support.
+ * Uses Sanity CDN directly (CORS + byte-range) for fastest playback.
  */
 export function getAudioSource(track: { audioUrl?: string }, trackIndex: number): {
   url: string
   source: 'sanity' | 'local' | 'fallback'
 } {
-  // First priority: Sanity CMS audio with proxy
   if (track.audioUrl) {
     return {
-      url: getProxiedAudioUrl(track.audioUrl),
+      url: track.audioUrl,
       source: 'sanity'
     }
   }
