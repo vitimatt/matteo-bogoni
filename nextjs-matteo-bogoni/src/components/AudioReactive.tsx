@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { Project, Track } from '@/sanity/client'
+import type { Project, Track } from '@/sanity/types'
 import { getAudioSource } from '@/lib/audio-utils'
 
 interface AudioReactiveProps {

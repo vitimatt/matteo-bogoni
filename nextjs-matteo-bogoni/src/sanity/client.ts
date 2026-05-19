@@ -1,23 +1,18 @@
 import { createClient } from '@sanity/client'
 
-export const client = createClient({
+const config = {
   projectId: 'ker8zst5',
   dataset: 'production',
-  useCdn: true,
-  token: 'sknib1jrHteF0Ii0nCXUIEJMXOZnaKo369HDrn8lqQIkDscc8OZE3GuNg8h2JOcklJtiBus5w2mU52NQyixg8PUAcE4ZfJeubK4HfduSMpYdmE9jhoSaPPk8zrbjpOV1zGj19FuAXigQmf5KLDguxYCO4iYu8MZSfJufMj5Xn8QBu5JV9IOD',
   apiVersion: '2023-05-03',
+} as const
+
+/** Fresh reads for server components (bypasses Sanity CDN cache). */
+export const serverClient = createClient({
+  ...config,
+  useCdn: false,
 })
 
-export interface Track {
-  _id: string
-  title: string
-  description?: string
-  audioUrl?: string
-}
+/** Legacy export — prefer serverClient for page data. */
+export const client = serverClient
 
-export interface Project {
-  _id: string
-  title: string
-  mediaType?: 'image' | 'video'
-  mediaUrl?: string
-}
+export type { Track, Project } from './types'
